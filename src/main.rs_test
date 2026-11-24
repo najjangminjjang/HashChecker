@@ -1,0 +1,993 @@
+#![windows_subsystem = "windows"]
+
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use clap::Parser;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use crc32fast::Hasher as Crc32Hasher;
+use eframe::egui;
+use egui::{ColorImage, FontData, FontDefinitions, FontFamily};
+use md5;
+use sevenz_rust::{Password, SevenZReader};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use zip::ZipArchive;
+
+#[cfg(target_os = "windows")]
+use winreg::enums::*;
+#[cfg(target_os = "windows")]
+use winreg::RegKey;
+
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+#[derive(Parser, Debug)]
+#[command(name = "hash-checker", version, about = "Hash verification tool")]
+struct Args {
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+    #[arg(long, value_name = "FILE")]
+    screenshot: Option<PathBuf>,
+    #[arg(long, default_value_t = true)]
+    crc32: bool,
+    #[arg(long, default_value_t = true)]
+    md5: bool,
+    #[arg(long, default_value_t = true)]
+    sha1: bool,
+    #[arg(long, default_value_t = true)]
+    sha256: bool,
+    #[arg(long, hide = true)]
+    register_context_menu: bool,
+    #[arg(long, hide = true)]
+    unregister_context_menu: bool,
+    #[arg(long, hide = true)]
+    gui: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HashOptions {
+    crc32: bool,
+    md5: bool,
+    sha1: bool,
+    sha256: bool,
+}
+
+#[derive(Debug, Clone)]
+enum HashTask {
+    File(PathBuf, HashOptions),
+    Archive(PathBuf, HashOptions),
+}
+
+#[derive(Debug, Clone)]
+struct FileHashResult {
+    path: String,
+    size: u64,
+    crc32: Option<String>,
+    md5: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ComputeMessage {
+    Progress(f32, String),
+    FileResult(FileHashResult),
+    ArchiveEntryResult(FileHashResult),
+    Finished,
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+struct HashResults {
+    crc32: Option<String>,
+    md5: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+}
+
+fn compute_hashes_streaming(
+    reader: &mut dyn Read,
+    opts: HashOptions,
+    total_size: u64,
+    tx: Option<&Sender<ComputeMessage>>,
+    label: &str,
+) -> HashResults {
+    let mut crc32_hasher = Crc32Hasher::new();
+    let mut sha1_hasher = Sha1::new();
+    let mut sha256_hasher = Sha256::new();
+    let mut md5_hasher = md5::Context::new();
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut processed_bytes: u64 = 0;
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).unwrap_or(0);
+        if bytes_read == 0 {
+            break;
+        }
+        let data = &buffer[..bytes_read];
+        if opts.crc32 {
+            crc32_hasher.update(data);
+        }
+        if opts.md5 {
+            md5_hasher.consume(data);
+        }
+        if opts.sha1 {
+            sha1_hasher.update(data);
+        }
+        if opts.sha256 {
+            sha256_hasher.update(data);
+        }
+
+        processed_bytes += bytes_read as u64;
+        if let Some(sender) = tx {
+            if total_size > 0 {
+                let p = (processed_bytes as f32 / total_size as f32).min(0.99);
+                let _ = sender.send(ComputeMessage::Progress(p, label.to_string()));
+            }
+        }
+    }
+
+    HashResults {
+        crc32: if opts.crc32 {
+            Some(format!("{:08x}", crc32_hasher.finalize()))
+        } else {
+            None
+        },
+        md5: if opts.md5 {
+            Some(format!("{:x}", md5_hasher.compute()))
+        } else {
+            None
+        },
+        sha1: if opts.sha1 {
+            Some(format!("{:x}", sha1_hasher.finalize()))
+        } else {
+            None
+        },
+        sha256: if opts.sha256 {
+            Some(format!("{:x}", sha256_hasher.finalize()))
+        } else {
+            None
+        },
+    }
+}
+
+fn process_regular_file(
+    path: &PathBuf,
+    opts: HashOptions,
+    tx: &Sender<ComputeMessage>,
+    current_name: &str,
+) -> Result<FileHashResult, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = BufReader::with_capacity(CHUNK_SIZE, file);
+    let results = compute_hashes_streaming(
+        &mut reader,
+        opts,
+        file_size,
+        Some(tx),
+        &format!("계산 중: {}", current_name),
+    );
+    Ok(FileHashResult {
+        path: current_name.to_string(),
+        size: file_size,
+        crc32: results.crc32,
+        md5: results.md5,
+        sha1: results.sha1,
+        sha256: results.sha256,
+    })
+}
+
+fn process_zip_archive(
+    path: &PathBuf,
+    opts: HashOptions,
+    tx: &Sender<ComputeMessage>,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open zip: {}", e))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {}", e))?;
+    let total_entries = archive.len();
+
+    for i in 0..total_entries {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read entry: {}", e))?;
+        let entry_name = entry.name().to_string();
+        let entry_size = entry.size();
+        if entry.is_dir() {
+            continue;
+        }
+        let progress = (i + 1) as f32 / total_entries.max(1) as f32;
+        let _ = tx.send(ComputeMessage::Progress(
+            progress,
+            format!("ZIP ({}/{}): {}", i + 1, total_entries, entry_name),
+        ));
+        let entry_results = compute_hashes_streaming(&mut entry, opts, entry_size, None, "");
+        let result = FileHashResult {
+            path: entry_name,
+            size: entry_size,
+            crc32: entry_results.crc32,
+            md5: entry_results.md5,
+            sha1: entry_results.sha1,
+            sha256: entry_results.sha256,
+        };
+        let _ = tx.send(ComputeMessage::ArchiveEntryResult(result));
+    }
+    Ok(())
+}
+
+fn process_7z_archive(
+    path: &PathBuf,
+    opts: HashOptions,
+    tx: &Sender<ComputeMessage>,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open 7z: {}", e))?;
+    let mut file_buf = BufReader::new(file);
+    let file_len = file_buf.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
+    let mut count_reader = SevenZReader::new(&mut file_buf, file_len, Password::empty())
+        .map_err(|e| format!("Failed to read 7z: {}", e))?;
+    let mut entry_count = 0usize;
+    count_reader
+        .for_each_entries(|entry, _reader| {
+            if !entry.is_directory() && entry.has_stream() {
+                entry_count += 1;
+            }
+            Ok(true)
+        })
+        .map_err(|e| format!("Failed to count entries: {}", e))?;
+    if entry_count == 0 {
+        return Ok(());
+    }
+    let file2 = File::open(path).map_err(|e| format!("Failed to open 7z: {}", e))?;
+    let mut file_buf2 = BufReader::new(file2);
+    let mut reader2 = SevenZReader::new(&mut file_buf2, file_len, Password::empty())
+        .map_err(|e| format!("Failed to read 7z: {}", e))?;
+    let mut processed = 0usize;
+    reader2
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory() || !entry.has_stream() {
+                return Ok(true);
+            }
+            let entry_name = entry.name().to_string();
+            let entry_size = entry.size();
+            let progress = (processed + 1) as f32 / entry_count as f32;
+            let _ = tx.send(ComputeMessage::Progress(
+                progress,
+                format!("7z ({}/{}): {}", processed + 1, entry_count, entry_name),
+            ));
+            let entry_results =
+                compute_hashes_streaming(entry_reader, opts, entry_size, None, "");
+            let result = FileHashResult {
+                path: entry_name,
+                size: entry_size,
+                crc32: entry_results.crc32,
+                md5: entry_results.md5,
+                sha1: entry_results.sha1,
+                sha256: entry_results.sha256,
+            };
+            let _ = tx.send(ComputeMessage::ArchiveEntryResult(result));
+            processed += 1;
+            Ok(true)
+        })
+        .map_err(|e| format!("Failed to process entries: {}", e))?;
+    Ok(())
+}
+
+fn compute_worker(rx: Receiver<HashTask>, tx: Sender<ComputeMessage>) {
+    while let Ok(task) = rx.recv() {
+        match task {
+            HashTask::File(path, opts) => {
+                let file_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let _ = tx.send(ComputeMessage::Progress(0.0, format!("계산 중: {}", file_name)));
+                match process_regular_file(&path, opts, &tx, &file_name) {
+                    Ok(result) => {
+                        let _ = tx.send(ComputeMessage::FileResult(result));
+                        let _ = tx.send(ComputeMessage::Progress(1.0, "완료 (100%)".to_string()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ComputeMessage::Error(e));
+                    }
+                }
+            }
+            HashTask::Archive(path, opts) => {
+                let file_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                // 1. 압축 파일 자체의 해시 먼저 계산
+                if let Ok(main_result) = process_regular_file(&path, opts, &tx, &file_name) {
+                    let _ = tx.send(ComputeMessage::FileResult(main_result));
+                }
+                // 2. 압축 파일 내부 개별 항목 해시 계산
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let archive_res = match ext.as_str() {
+                    "zip" => process_zip_archive(&path, opts, &tx),
+                    "7z" => process_7z_archive(&path, opts, &tx),
+                    _ => Err("Unsupported archive format".to_string()),
+                };
+                match archive_res {
+                    Ok(()) => {
+                        let _ = tx.send(ComputeMessage::Progress(1.0, "완료 (100%)".to_string()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ComputeMessage::Error(e));
+                    }
+                }
+            }
+        }
+        let _ = tx.send(ComputeMessage::Finished);
+    }
+}
+
+fn save_color_image_as_png(
+    image: &ColorImage,
+    path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let size = image.size;
+    let pixels = &image.pixels;
+    let mut rgba = Vec::with_capacity(size[0] * size[1] * 4);
+    for pixel in pixels {
+        rgba.push(pixel.r());
+        rgba.push(pixel.g());
+        rgba.push(pixel.b());
+        rgba.push(pixel.a());
+    }
+    let img = image::RgbaImage::from_raw(size[0] as u32, size[1] as u32, rgba)
+        .ok_or("Failed to create image buffer")?;
+    img.save(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn register_context_menu() -> Result<(), Box<dyn std::error::Error>> {
+    let exe_path = std::env::current_exe()?.to_string_lossy().to_string();
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    let key_path = r"*\shell\HashChecker";
+    let (key, _) = hkcr.create_subkey(key_path)?;
+    key.set_value("", &"Hash Checker로 해시 계산")?;
+    key.set_value("Icon", &exe_path)?;
+    let command_path = r"*\shell\HashChecker\command";
+    let (cmd_key, _) = hkcr.create_subkey(command_path)?;
+    cmd_key.set_value("", &format!("\"{}\" --gui \"%1\"", exe_path))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn unregister_context_menu() -> Result<(), Box<dyn std::error::Error>> {
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    hkcr.delete_subkey_all(r"*\shell\HashChecker")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_context_menu() -> Result<(), Box<dyn std::error::Error>> {
+    Err("Context menu registration only supported on Windows".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unregister_context_menu() -> Result<(), Box<dyn std::error::Error>> {
+    Err("Context menu unregistration only supported on Windows".into())
+}
+
+struct HashCheckerApp {
+    file_path: String,
+    show_crc32: bool,
+    show_md5: bool,
+    show_sha1: bool,
+    show_sha256: bool,
+    crc32_result: String,
+    md5_result: String,
+    sha1_result: String,
+    sha256_result: String,
+    compute_tx: Sender<HashTask>,
+    compute_rx: Receiver<ComputeMessage>,
+    computing: bool,
+    progress: f32,
+    progress_text: String,
+    screenshot_path: Option<PathBuf>,
+    screenshot_requested: bool,
+    auto_compute_triggered: bool,
+    archive_results: Arc<Mutex<Vec<FileHashResult>>>,
+    show_archive_view: bool,
+    verify_input: String,
+}
+
+impl Default for HashCheckerApp {
+    fn default() -> Self {
+        let (task_tx, task_rx) = bounded(10);
+        let (msg_tx, msg_rx) = bounded(200);
+        let archive_results = Arc::new(Mutex::new(Vec::new()));
+        let archive_results_clone = archive_results.clone();
+        thread::spawn(move || {
+            compute_worker(task_rx, msg_tx);
+        });
+        Self {
+            file_path: String::new(),
+            show_crc32: true,
+            show_md5: true,
+            show_sha1: true,
+            show_sha256: true,
+            crc32_result: String::new(),
+            md5_result: String::new(),
+            sha1_result: String::new(),
+            sha256_result: String::new(),
+            compute_tx: task_tx,
+            compute_rx: msg_rx,
+            computing: false,
+            progress: 0.0,
+            progress_text: String::new(),
+            screenshot_path: None,
+            screenshot_requested: false,
+            auto_compute_triggered: false,
+            archive_results: archive_results_clone,
+            show_archive_view: false,
+            verify_input: String::new(),
+        }
+    }
+}
+
+fn draw_vertical_hash_card(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    show_crc32: bool,
+    show_md5: bool,
+    show_sha1: bool,
+    show_sha256: bool,
+    crc32_result: String,
+    md5_result: String,
+    sha1_result: String,
+    sha256_result: String,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized([65.0, 20.0], egui::Label::new(label).selectable(false));
+        let response = ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(ui.available_width() - 45.0),
+        );
+        if ui.button("📋").clicked() && !value.is_empty() {
+            ui.output_mut(|o| o.copied_text = value.clone());
+        }
+        response.context_menu(|ui| {
+            if ui.button("Copy hash only").clicked() {
+                ui.output_mut(|o| o.copied_text = value.clone());
+                ui.close_menu();
+            }
+            let copy_label = format!("Copy \"{} {}\"", label.trim_end_matches(':'), value);
+            if ui.button(copy_label).clicked() {
+                let copy_text = format!("{} {}", label.trim_end_matches(':'), value);
+                ui.output_mut(|o| o.copied_text = copy_text);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Copy all results").clicked() {
+                let mut all = String::new();
+                if show_crc32 && !crc32_result.is_empty() {
+                    all.push_str(&format!("CRC32:  {}\n", crc32_result));
+                }
+                if show_md5 && !md5_result.is_empty() {
+                    all.push_str(&format!("MD5:    {}\n", md5_result));
+                }
+                if show_sha1 && !sha1_result.is_empty() {
+                    all.push_str(&format!("SHA1:   {}\n", sha1_result));
+                }
+                if show_sha256 && !sha256_result.is_empty() {
+                    all.push_str(&format!("SHA256: {}\n", sha256_result));
+                }
+                ui.output_mut(|o| o.copied_text = all.trim_end().to_string());
+                ui.close_menu();
+            }
+        });
+    });
+}
+
+impl eframe::App for HashCheckerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.computing {
+            ctx.request_repaint();
+        }
+        while let Ok(msg) = self.compute_rx.try_recv() {
+            match msg {
+                ComputeMessage::Progress(p, text) => {
+                    self.progress = p;
+                    self.progress_text = text;
+                }
+                ComputeMessage::FileResult(result) => {
+                    self.crc32_result = result.crc32.unwrap_or_default();
+                    self.md5_result = result.md5.unwrap_or_default();
+                    self.sha1_result = result.sha1.unwrap_or_default();
+                    self.sha256_result = result.sha256.unwrap_or_default();
+                }
+                ComputeMessage::ArchiveEntryResult(result) => {
+                    if let Ok(mut archive_results) = self.archive_results.lock() {
+                        archive_results.push(result);
+                    }
+                    self.show_archive_view = true;
+                }
+                ComputeMessage::Finished => {
+                    self.computing = false;
+                }
+                ComputeMessage::Error(e) => {
+                    eprintln!("Compute error: {}", e);
+                    self.progress_text = format!("오류: {}", e);
+                    self.computing = false;
+                }
+            }
+        }
+        if !self.auto_compute_triggered && !self.file_path.is_empty() && !self.computing {
+            self.auto_compute_triggered = true;
+            self.start_computation();
+        }
+        if let Some(_screenshot_path) = self.screenshot_path.clone() {
+            if !self.screenshot_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                self.screenshot_requested = true;
+            }
+        }
+        ctx.input(|i| {
+            // 파일 드래그 앤 드롭 지원
+            if !i.raw.dropped_files.is_empty() {
+                if let Some(path) = &i.raw.dropped_files[0].path {
+                    self.file_path = path.display().to_string();
+                    self.clear_results();
+                    self.auto_compute_triggered = false;
+                }
+            }
+            for event in &i.events {
+                if let egui::Event::Screenshot { image, .. } = event {
+                    if let Some(screenshot_path) = &self.screenshot_path {
+                        let _ = save_color_image_as_png(image, screenshot_path);
+                        std::process::exit(0);
+                    }
+                }
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Hash Checker");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("File:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.file_path)
+                        .desired_width(ui.available_width() - 75.0),
+                );
+                if response.changed() {
+                    self.clear_results();
+                    self.auto_compute_triggered = false;
+                }
+                if ui.button("Browse").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("All files", &["*"])
+                        .add_filter("Archives", &["zip", "7z"])
+                        .pick_file()
+                    {
+                        self.file_path = path.display().to_string();
+                        self.clear_results();
+                        self.auto_compute_triggered = false;
+                    }
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.show_crc32, "CRC32");
+                ui.checkbox(&mut self.show_md5, "MD5");
+                ui.checkbox(&mut self.show_sha1, "SHA1");
+                ui.checkbox(&mut self.show_sha256, "SHA256");
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Progress:");
+                ui.add(
+                    egui::ProgressBar::new(self.progress)
+                        .show_percentage()
+                        .animate(self.computing),
+                );
+            });
+            if !self.progress_text.is_empty() {
+                ui.label(&self.progress_text);
+            }
+            ui.separator();
+
+            let show_crc32 = self.show_crc32;
+            let show_md5 = self.show_md5;
+            let show_sha1 = self.show_sha1;
+            let show_sha256 = self.show_sha256;
+            let crc32_result = self.crc32_result.clone();
+            let md5_result = self.md5_result.clone();
+            let sha1_result = self.sha1_result.clone();
+            let sha256_result = self.sha256_result.clone();
+
+            if !self.file_path.is_empty() {
+                if self.show_crc32 {
+                    draw_vertical_hash_card(
+                        ui,
+                        "CRC32:",
+                        &mut self.crc32_result,
+                        show_crc32,
+                        show_md5,
+                        show_sha1,
+                        show_sha256,
+                        crc32_result.clone(),
+                        md5_result.clone(),
+                        sha1_result.clone(),
+                        sha256_result.clone(),
+                    );
+                }
+                if self.show_md5 {
+                    draw_vertical_hash_card(
+                        ui,
+                        "MD5:",
+                        &mut self.md5_result,
+                        show_crc32,
+                        show_md5,
+                        show_sha1,
+                        show_sha256,
+                        crc32_result.clone(),
+                        md5_result.clone(),
+                        sha1_result.clone(),
+                        sha256_result.clone(),
+                    );
+                }
+                if self.show_sha1 {
+                    draw_vertical_hash_card(
+                        ui,
+                        "SHA1:",
+                        &mut self.sha1_result,
+                        show_crc32,
+                        show_md5,
+                        show_sha1,
+                        show_sha256,
+                        crc32_result.clone(),
+                        md5_result.clone(),
+                        sha1_result.clone(),
+                        sha256_result.clone(),
+                    );
+                }
+                if self.show_sha256 {
+                    draw_vertical_hash_card(
+                        ui,
+                        "SHA256:",
+                        &mut self.sha256_result,
+                        show_crc32,
+                        show_md5,
+                        show_sha1,
+                        show_sha256,
+                        crc32_result.clone(),
+                        md5_result.clone(),
+                        sha1_result.clone(),
+                        sha256_result.clone(),
+                    );
+                }
+            }
+
+            // 해시 비교 입력창 (일반 파일 / 압축 파일 모두 사용 가능)
+            if !self.file_path.is_empty() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("해시 비교:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.verify_input)
+                            .hint_text("비교할 해시값을 붙여넣으세요")
+                            .desired_width(350.0),
+                    );
+                    if !self.verify_input.trim().is_empty() {
+                        let verify_lower = self.verify_input.trim().to_lowercase();
+                        let mut matched_info: Option<String> = None;
+
+                        for (hash, label) in [
+                            (&self.crc32_result, "CRC32"),
+                            (&self.md5_result, "MD5"),
+                            (&self.sha1_result, "SHA1"),
+                            (&self.sha256_result, "SHA256"),
+                        ] {
+                            if !hash.is_empty() && hash.to_lowercase() == verify_lower {
+                                matched_info = Some(format!("원본 파일 - {}", label));
+                                break;
+                            }
+                        }
+
+                        if matched_info.is_none() {
+                            if let Ok(archive_results) = self.archive_results.lock() {
+                                'outer: for result in archive_results.iter() {
+                                    for (hash, label) in [
+                                        (result.crc32.as_ref(), "CRC32"),
+                                        (result.md5.as_ref(), "MD5"),
+                                        (result.sha1.as_ref(), "SHA1"),
+                                        (result.sha256.as_ref(), "SHA256"),
+                                    ] {
+                                        if let Some(h) = hash {
+                                            if h.to_lowercase() == verify_lower {
+                                                matched_info =
+                                                    Some(format!("{} - {}", result.path, label));
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(info) = matched_info {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0, 180, 0),
+                                format!("✓ 일치 ({})", info),
+                            );
+                        } else {
+                            ui.colored_label(egui::Color32::RED, "✗ 불일치");
+                        }
+                    }
+                });
+            }
+
+            if self.show_archive_view {
+                ui.separator();
+                ui.strong("Archive Entries:");
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        if let Ok(archive_results) = self.archive_results.lock() {
+                            for result in archive_results.iter() {
+                                ui.group(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.strong(&result.path);
+                                            ui.label(format!("({} bytes)", result.size));
+                                        });
+                                        ui.separator();
+                                        if self.show_crc32 {
+                                            if let Some(crc32) = &result.crc32 {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_sized([60.0, 18.0], egui::Label::new("CRC32:"));
+                                                    ui.add(egui::Label::new(crc32).selectable(true));
+                                                    if ui.button("📋").clicked() {
+                                                        ui.output_mut(|o| o.copied_text = crc32.clone());
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        if self.show_md5 {
+                                            if let Some(md5) = &result.md5 {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_sized([60.0, 18.0], egui::Label::new("MD5:"));
+                                                    ui.add(egui::Label::new(md5).selectable(true));
+                                                    if ui.button("📋").clicked() {
+                                                        ui.output_mut(|o| o.copied_text = md5.clone());
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        if self.show_sha1 {
+                                            if let Some(sha1) = &result.sha1 {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_sized([60.0, 18.0], egui::Label::new("SHA1:"));
+                                                    ui.add(egui::Label::new(sha1).selectable(true));
+                                                    if ui.button("📋").clicked() {
+                                                        ui.output_mut(|o| o.copied_text = sha1.clone());
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        if self.show_sha256 {
+                                            if let Some(sha256) = &result.sha256 {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_sized([60.0, 18.0], egui::Label::new("SHA256:"));
+                                                    ui.add(egui::Label::new(sha256).selectable(true));
+                                                    if ui.button("📋").clicked() {
+                                                        ui.output_mut(|o| o.copied_text = sha256.clone());
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let compute_btn = ui.add_enabled(
+                    !self.computing && !self.file_path.is_empty(),
+                    egui::Button::new("Compute Hashes"),
+                );
+                if compute_btn.clicked() {
+                    self.clear_results();
+                    self.start_computation();
+                }
+                if ui.button("Clear").clicked() {
+                    self.clear_results();
+                }
+                if ui.button("Save Results").clicked() {
+                    self.save_results_to_file();
+                }
+                #[cfg(target_os = "windows")]
+                if ui.button("Register Context Menu").clicked() {
+                    let _ = register_context_menu();
+                }
+                #[cfg(target_os = "windows")]
+                if ui.button("Unregister Context Menu").clicked() {
+                    let _ = unregister_context_menu();
+                }
+            });
+        });
+    }
+}
+
+impl HashCheckerApp {
+    fn clear_results(&mut self) {
+        self.crc32_result.clear();
+        self.md5_result.clear();
+        self.sha1_result.clear();
+        self.sha256_result.clear();
+        if let Ok(mut archive_results) = self.archive_results.lock() {
+            archive_results.clear();
+        }
+        self.show_archive_view = false;
+        self.verify_input.clear();
+        self.progress = 0.0;
+        self.progress_text.clear();
+    }
+
+    fn start_computation(&mut self) {
+        self.computing = true;
+        self.progress = 0.0;
+        self.progress_text = "준비 중...".to_string();
+        let opts = HashOptions {
+            crc32: self.show_crc32,
+            md5: self.show_md5,
+            sha1: self.show_sha1,
+            sha256: self.show_sha256,
+        };
+        let path = PathBuf::from(self.file_path.clone());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let task = if ext == "zip" || ext == "7z" {
+            HashTask::Archive(path, opts)
+        } else {
+            HashTask::File(path, opts)
+        };
+        let _ = self.compute_tx.send(task);
+    }
+
+    fn save_results_to_file(&self) {
+        if self.file_path.is_empty() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Save hash results")
+            .set_file_name("hash_results.txt")
+            .save_file()
+        {
+            let mut content = String::new();
+            content.push_str(&format!("File: {}\n", self.file_path));
+            content.push_str("---\n");
+            if self.show_crc32 && !self.crc32_result.is_empty() {
+                content.push_str(&format!("CRC32:  {}\n", self.crc32_result));
+            }
+            if self.show_md5 && !self.md5_result.is_empty() {
+                content.push_str(&format!("MD5:    {}\n", self.md5_result));
+            }
+            if self.show_sha1 && !self.sha1_result.is_empty() {
+                content.push_str(&format!("SHA1:   {}\n", self.sha1_result));
+            }
+            if self.show_sha256 && !self.sha256_result.is_empty() {
+                content.push_str(&format!("SHA256: {}\n", self.sha256_result));
+            }
+            if let Ok(archive_results) = self.archive_results.lock() {
+                if !archive_results.is_empty() {
+                    content.push_str("\n=== Archive Entries ===\n");
+                    for result in archive_results.iter() {
+                        content.push_str(&format!("\n[Archive Entry] {}\n", result.path));
+                        content.push_str(&format!("  Size: {} bytes\n", result.size));
+                        if let Some(v) = &result.crc32 {
+                            content.push_str(&format!("  CRC32:  {}\n", v));
+                        }
+                        if let Some(v) = &result.md5 {
+                            content.push_str(&format!("  MD5:    {}\n", v));
+                        }
+                        if let Some(v) = &result.sha1 {
+                            content.push_str(&format!("  SHA1:   {}\n", v));
+                        }
+                        if let Some(v) = &result.sha256 {
+                            content.push_str(&format!("  SHA256: {}\n", v));
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::write(&path, content);
+        }
+    }
+}
+
+fn setup_korean_font(ctx: &egui::Context) {
+    #[cfg(target_os = "windows")]
+    {
+        let malgun_path = "C:\\Windows\\Fonts\\malgun.ttf";
+        if std::path::Path::new(malgun_path).exists() {
+            if let Ok(data) = std::fs::read(malgun_path) {
+                let mut fonts = FontDefinitions::default();
+                fonts
+                    .font_data
+                    .insert("malgun".to_owned(), FontData::from_owned(data));
+                fonts
+                    .families
+                    .entry(FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "malgun".to_owned());
+                fonts
+                    .families
+                    .entry(FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "malgun".to_owned());
+                ctx.set_fonts(fonts);
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let args = Args::parse();
+    if args.register_context_menu {
+        let _ = register_context_menu();
+        return Ok(());
+    }
+    if args.unregister_context_menu {
+        let _ = unregister_context_menu();
+        return Ok(());
+    }
+
+    let mut native_options = eframe::NativeOptions::default();
+    native_options.viewport = egui::ViewportBuilder::default()
+        .with_inner_size([900.0, 720.0])
+        .with_resizable(true);
+    if args.screenshot.is_some() {
+        native_options.viewport = native_options
+            .viewport
+            .with_active(false)
+            .with_visible(true);
+        #[cfg(target_os = "windows")]
+        {
+            native_options.viewport =
+                native_options.viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            native_options.event_loop_builder = Some(Box::new(|event_loop| {
+                use winit::platform::macos::EventLoopBuilderExtMacOS;
+                event_loop.set_activate_ignoring_other_apps(false);
+            }));
+        }
+    }
+    let screenshot_path = args.screenshot.clone();
+    let initial_file_path = args
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    eframe::run_native(
+        "Hash Checker",
+        native_options,
+        Box::new(move |cc| {
+            setup_korean_font(&cc.egui_ctx);
+            let mut app = HashCheckerApp::default();
+            app.screenshot_path = screenshot_path;
+            app.file_path = initial_file_path;
+            Ok(Box::new(app))
+        }),
+    )
+}
